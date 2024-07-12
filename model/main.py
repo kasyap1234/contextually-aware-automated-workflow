@@ -266,7 +266,7 @@ if __name__ == "__main__":
         }
         for i in range(batch_size)
     ]
-
+    
     # Run the flow with the batch of data points
     mini_zap.run_flow(batch_data)
 

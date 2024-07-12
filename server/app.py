@@ -1,29 +1,32 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, List
 import json
 from datetime import datetime
+import numpy as np
 
 from model.main import MiniZapWithEDA
-
 
 app = FastAPI()
 mini_zap = MiniZapWithEDA()
 
 class TriggerPayload(BaseModel):
-    value: float
+    value: int
     source: str = "api"
 
 @app.post("/trigger")
-async def trigger_flow(payload: TriggerPayload):
+async def trigger_flow(payloads: List[TriggerPayload]):
     try:
-        full_payload = {
-            "timestamp": datetime.now().isoformat(),
-            "value": payload.value,
-            "source": payload.source
-        }
-        result = mini_zap.run_flow(full_payload)
+        full_payloads = [
+            {
+                "timestamp": datetime.now().isoformat(),
+                "value": payload.value,
+                "source": payload.source
+            }
+            for payload in payloads
+        ]
+        result = mini_zap.run_flow(full_payloads)
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -31,10 +34,17 @@ async def trigger_flow(payload: TriggerPayload):
 @app.get("/results")
 async def get_results():
     try:
-        results = mini_zap.es.search(index="mini_zap_flow_results", body={"query": {"match_all": {}}}, size=10)
-        return [hit['_source'] for hit in results['hits']['hits']]
+        df = mini_zap.process_data()
+        
+        
+        df = df.replace([np.inf, -np.inf, np.nan], None)
+        
+        results = df.to_dict(orient='records')
+        return results[:10] 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 @app.get("/plot")
 async def get_plot():
