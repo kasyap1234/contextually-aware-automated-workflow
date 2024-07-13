@@ -163,30 +163,59 @@ class DecisionMakerAgent(AIAgent):
         Based on the following analysis and the chosen action {action}, suggest detailed steps to take:
         {json.dumps(data)}
         
-        Provide your response in the following JSON format:
+        Your response MUST be in the following JSON format, with no additional text or markdown formatting:
         {{
             "recommended_action": "{action}",
             "justification": "Explanation of why this action is recommended",
-            "detailed_steps": ["List", "of", "detailed", "steps", "to", "implement", "the", "action"],
-            "potential_risks": ["List", "of", "potential", "risks"],
-            "expected_outcomes": ["List", "of", "expected", "outcomes"]
+            "detailed_steps": ["Step 1", "Step 2", "Step 3"],
+            "potential_risks": ["Risk 1", "Risk 2", "Risk 3"],
+            "expected_outcomes": ["Outcome 1", "Outcome 2", "Outcome 3"]
         }}
         """
         ai_decision = self.call_gemini_api(prompt)
+        print("Gemini API response:", ai_decision)
+        
+        # Remove markdown code block indicators if present
+        ai_decision = ai_decision.strip().removeprefix("```json").removesuffix("```")
         
         try:
             decision = json.loads(ai_decision)
-        except json.JSONDecodeError:
-            print(f"Error: Gemini API response is not a valid JSON string. Attempting to extract information.")
+            # Validate the structure of the decision
+            required_keys = ["recommended_action", "justification", "detailed_steps", "potential_risks", "expected_outcomes"]
+            if not all(key in decision for key in required_keys):
+                raise ValueError("Response is missing required keys")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error parsing Gemini API response: {str(e)}. Falling back to default structure.")
             decision = {
                 "recommended_action": action,
-                "justification": self.extract_text_between(ai_decision, "justification", "detailed_steps"),
-                "detailed_steps": self.extract_list(ai_decision, "detailed_steps"),
-                "potential_risks": self.extract_list(ai_decision, "potential_risks"),
-                "expected_outcomes": self.extract_list(ai_decision, "expected_outcomes")
+                "justification": "Unable to parse API response",
+                "detailed_steps": ["Review API response", "Adjust prompt if necessary", "Retry decision-making process"],
+                "potential_risks": ["Incomplete decision information", "Potential misalignment with data analysis"],
+                "expected_outcomes": ["Improved API response parsing", "More accurate decision-making"]
             }
         
         return decision
+
+        
+        
+        try:
+            decision = json.loads(ai_decision)
+            # Validate the structure of the decision
+            required_keys = ["recommended_action", "justification", "detailed_steps", "potential_risks", "expected_outcomes"]
+            if not all(key in decision for key in required_keys):
+                raise ValueError("Response is missing required keys")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error parsing Gemini API response: {str(e)}. Falling back to default structure.")
+            decision = {
+                "recommended_action": action,
+                "justification": "Unable to parse API response",
+                "detailed_steps": ["Review API response", "Adjust prompt if necessary", "Retry decision-making process"],
+                "potential_risks": ["Incomplete decision information", "Potential misalignment with data analysis"],
+                "expected_outcomes": ["Improved API response parsing", "More accurate decision-making"]
+            }
+        
+        return decision
+
 
     def extract_text_between(self, text, start_marker, end_marker):
         start = text.find(start_marker)
@@ -291,19 +320,13 @@ class MiniZapWithEDA:
         flow_result = {
             "timestamp": datetime.now().isoformat(),
             "enriched_data_summary": f"Processed {len(enriched_data)} data points",
-            "analysis_result_summary": {
+            "analysis_result_summary": json.dumps({
                 "basic_stats": analysis_result.get("basic_stats", {}),
                 "trend": analysis_result.get("trend", ""),
                 "clusters": analysis_result.get("clusters", {}),
                 "forecast": analysis_result.get("forecast", [])
-            },
-            "decision_summary": {
-                "recommended_action": decision.get("recommended_action", ""),
-                "justification": decision.get("justification", ""),
-                "detailed_steps": decision.get("detailed_steps", []),
-                "potential_risks": decision.get("potential_risks", []),
-                "expected_outcomes": decision.get("expected_outcomes", [])
-            }
+            }),
+            "decision_summary": json.dumps(decision)
         }
         
         vector = self.model.encode([json.dumps(flow_result)])[0].tolist()
@@ -312,8 +335,15 @@ class MiniZapWithEDA:
             index.upsert([(str(datetime.now().timestamp()), vector, flow_result)])
         except Exception as e:
             print(f"Error upserting flow result to Pinecone: {str(e)}")
+            print("Attempting to upsert with simplified metadata...")
+            simplified_flow_result = {k: str(v) for k, v in flow_result.items()}
+            try:
+                index.upsert([(str(datetime.now().timestamp()), vector, simplified_flow_result)])
+            except Exception as e:
+                print(f"Error upserting simplified flow result to Pinecone: {str(e)}")
 
         return flow_result
+
 
 if __name__ == "__main__":
     mini_zap = MiniZapWithEDA()
