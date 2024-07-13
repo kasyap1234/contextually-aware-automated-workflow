@@ -3,9 +3,8 @@ from typing import Dict, Any, List
 import json
 from datetime import datetime, timedelta
 import pandas as pd
-import matplotlib.pyplot as plt
-import requests
 import numpy as np
+import requests
 from pinecone import Pinecone, ServerlessSpec
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
@@ -13,6 +12,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from statsmodels.tsa.arima.model import ARIMA
 from dotenv import load_dotenv
+import random
+
 load_dotenv()
 
 # Environment setup
@@ -124,38 +125,82 @@ class AnalystAgent(AIAgent):
         return analysis_result
 
 class DecisionMakerAgent(AIAgent):
+    def __init__(self, name: str, role: str):
+        super().__init__(name, role)
+        self.q_table = {}
+        self.learning_rate = 0.1
+        self.discount_factor = 0.9
+        self.epsilon = 0.1
+
+    def get_state(self, data):
+        # Simplify the state representation
+        return tuple(sorted(data.keys()))
+
+    def get_action(self, state):
+        if random.random() < self.epsilon or state not in self.q_table:
+            return self.generate_random_action()
+        else:
+            return max(self.q_table[state], key=self.q_table[state].get)
+
+    def generate_random_action(self):
+        actions = ["increase_marketing", "reduce_costs", "expand_product_line", "improve_customer_service"]
+        return random.choice(actions)
+
+    def update_q_table(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0 for a in ["increase_marketing", "reduce_costs", "expand_product_line", "improve_customer_service"]}
+        
+        current_q = self.q_table[state][action]
+        max_next_q = max(self.q_table.get(next_state, {}).values(), default=0)
+        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
+        self.q_table[state][action] = new_q
+
     def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.get_state(data)
+        action = self.get_action(state)
+        
         prompt = f"""
-        Based on the following analysis, suggest actions to take:
+        Based on the following analysis and the chosen action {action}, suggest detailed steps to take:
         {json.dumps(data)}
         
         Provide your response in the following JSON format:
         {{
-            "recommended_action": "Brief description of the main action to take",
+            "recommended_action": "{action}",
             "justification": "Explanation of why this action is recommended",
-            "alternative_actions": ["List", "of", "alternative", "actions"],
+            "detailed_steps": ["List", "of", "detailed", "steps", "to", "implement", "the", "action"],
             "potential_risks": ["List", "of", "potential", "risks"],
-            "next_steps": ["List", "of", "next", "steps", "to", "implement", "the", "action"]
+            "expected_outcomes": ["List", "of", "expected", "outcomes"]
         }}
         """
         ai_decision = self.call_gemini_api(prompt)
         
-        # Remove any Markdown code block indicators
-        ai_decision = ai_decision.replace('```json', '').replace('```', '').strip()
-        
         try:
             decision = json.loads(ai_decision)
         except json.JSONDecodeError:
-            print(f"Error: Gemini API response is not a valid JSON string: {ai_decision}")
+            print(f"Error: Gemini API response is not a valid JSON string. Attempting to extract information.")
             decision = {
-                "recommended_action": "Take no action",
-                "justification": "The response from the Gemini API is not in the expected format.",
-                "alternative_actions": [],
-                "potential_risks": [],
-                "next_steps": []
+                "recommended_action": action,
+                "justification": self.extract_text_between(ai_decision, "justification", "detailed_steps"),
+                "detailed_steps": self.extract_list(ai_decision, "detailed_steps"),
+                "potential_risks": self.extract_list(ai_decision, "potential_risks"),
+                "expected_outcomes": self.extract_list(ai_decision, "expected_outcomes")
             }
         
         return decision
+
+    def extract_text_between(self, text, start_marker, end_marker):
+        start = text.find(start_marker)
+        end = text.find(end_marker)
+        if start != -1 and end != -1:
+            return text[start + len(start_marker):end].strip()
+        return ""
+
+    def extract_list(self, text, marker):
+        start = text.find(marker)
+        if start != -1:
+            list_text = text[start + len(marker):]
+            return [item.strip() for item in list_text.split('\n') if item.strip().startswith('-')]
+        return []
 
 class MiniZapWithEDA:
     def __init__(self):
@@ -165,6 +210,8 @@ class MiniZapWithEDA:
             "analyst": AnalystAgent("Analyst", "Performs advanced EDA"),
             "decision_maker": DecisionMakerAgent("DecisionMaker", "Makes strategic decisions based on analysis")
         }
+        self.previous_state = None
+        self.previous_action = None
 
     def trigger(self, payloads: List[Dict[str, Any]]):
         print("Triggers received:")
@@ -219,24 +266,44 @@ class MiniZapWithEDA:
         print(f"Decision made: {json.dumps(decision, indent=2)}")
         return decision
 
+    def provide_feedback(self, reward: float):
+        if self.previous_state and self.previous_action:
+            current_state = self.agents["decision_maker"].get_state(self.process_data().to_dict())
+            self.agents["decision_maker"].update_q_table(
+                self.previous_state, 
+                self.previous_action, 
+                reward, 
+                current_state
+            )
+        else:
+            print("No previous state or action to update.")
+
     def run_flow(self, payloads: List[Dict[str, Any]]):
         enriched_data = self.trigger(payloads)
         df = self.process_data()
         analysis_result = self.perform_eda(df)
         decision = self.take_action(analysis_result)
         
+        current_state = self.agents["decision_maker"].get_state(df.to_dict())
+        self.previous_state = current_state
+        self.previous_action = decision["recommended_action"]
+        
         flow_result = {
             "timestamp": datetime.now().isoformat(),
             "enriched_data_summary": f"Processed {len(enriched_data)} data points",
-            "analysis_result_summary": json.dumps({
+            "analysis_result_summary": {
                 "basic_stats": analysis_result.get("basic_stats", {}),
                 "trend": analysis_result.get("trend", ""),
-                "clusters": analysis_result.get("clusters", {})
-            }),
-            "decision_summary": json.dumps({
+                "clusters": analysis_result.get("clusters", {}),
+                "forecast": analysis_result.get("forecast", [])
+            },
+            "decision_summary": {
                 "recommended_action": decision.get("recommended_action", ""),
-                "justification": decision.get("justification", "")
-            })
+                "justification": decision.get("justification", ""),
+                "detailed_steps": decision.get("detailed_steps", []),
+                "potential_risks": decision.get("potential_risks", []),
+                "expected_outcomes": decision.get("expected_outcomes", [])
+            }
         }
         
         vector = self.model.encode([json.dumps(flow_result)])[0].tolist()
@@ -267,7 +334,7 @@ if __name__ == "__main__":
             "conversion_rate": round(0.03 + i * 0.001, 3),
             "customer_satisfaction_score": round(4.0 + i * 0.05, 1),
             "website_traffic": 50000 + i * 1000,
-            "social_media_engagement": 5000 + i * 200,
+             "social_media_engagement": 5000 + i * 200,
             "product_inventory": 1000 - i * 20,
             "employee_productivity": round(0.8 + i * 0.01, 2),
             "source": f"department_{i % 5}"
@@ -279,6 +346,10 @@ if __name__ == "__main__":
 
     print("\nFinal Flow Result:")
     print(json.dumps(flow_result, indent=2))
+
+    # Simulate feedback
+    feedback_reward = 0.5  # This could be based on actual business outcomes
+    mini_zap.provide_feedback(feedback_reward)
 
     print("\nRetrieving last flow result from Pinecone:")
     query_response = index.query(vector=[0]*384, top_k=1, include_metadata=True)
