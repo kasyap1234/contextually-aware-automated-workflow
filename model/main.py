@@ -32,7 +32,7 @@ if PINECONE_INDEX_NAME not in pinecone.list_indexes().names():
         metric='euclidean',
         spec=ServerlessSpec(
             cloud='aws',
-            region='us-west-2'
+            region='us-east-1'
         )
     )
 
@@ -76,36 +76,41 @@ class AnalystAgent(AIAgent):
         data = data.sort_index()
         data.index = pd.DatetimeIndex(data.index).to_period('D')
 
-        # Handle missing values
-        data_imputed = self.imputer.fit_transform(data[['value']])
-        
+        # Select numeric columns
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+
+        # Handle missing values and scale data
+        data_imputed = self.imputer.fit_transform(data[numeric_columns])
+        data_scaled = self.scaler.fit_transform(data_imputed)
+
         # Perform advanced EDA
-        stats = pd.Series(data_imputed.flatten()).describe()
-        trend = 'increasing' if data_imputed[-1] > data_imputed[0] else 'decreasing'
+        stats = pd.DataFrame(data_imputed, columns=numeric_columns).describe().to_dict()
+        
+        # Calculate overall trend
+        trend = 'increasing' if np.mean(data_imputed[-1] > data_imputed[0]) else 'decreasing'
         
         # Perform clustering
-        scaled_data = self.scaler.fit_transform(data_imputed)
         n_clusters = min(3, len(data))
         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
         
         try:
-            data['cluster'] = kmeans.fit_predict(scaled_data)
+            data['cluster'] = kmeans.fit_predict(data_scaled)
             clusters = data['cluster'].value_counts().to_dict()
         except Exception as e:
             print(f"Clustering failed: {str(e)}")
             clusters = {"error": str(e)}
         
-        # Perform time series forecasting
+        # Perform time series forecasting (using the first numeric column as an example)
         try:
-            model = ARIMA(data_imputed.flatten(), order=(1,0,0))
+            model = ARIMA(data_imputed[:, 0], order=(1,0,0))
             results = model.fit()
             forecast = results.forecast(steps=5)
         except Exception as e:
             print(f"ARIMA forecasting failed: {str(e)}")
-            forecast = np.array([data_imputed.mean()] * 5)  # fallback to mean if ARIMA fails
+            forecast = np.array([data_imputed[:, 0].mean()] * 5)  # fallback to mean if ARIMA fails
 
         analysis_result = {
-            "basic_stats": stats.to_dict(),
+            "basic_stats": stats,
             "trend": trend,
             "clusters": clusters,
             "forecast": forecast.tolist()
@@ -166,7 +171,6 @@ class MiniZapWithEDA:
         print(json.dumps(payloads, indent=2))
         enriched_data = self.agents["collector"].process(payloads)
         
-        # Store in Pinecone
         for data in enriched_data:
             vector = self.model.encode([json.dumps(data)])[0].tolist()
             try:
@@ -177,9 +181,7 @@ class MiniZapWithEDA:
         return enriched_data
 
     def process_data(self):
-        # Query all vectors from Pinecone
         query_response = index.query(vector=[0]*384, top_k=1000, include_metadata=True)
-        
         data = [match['metadata'] for match in query_response['matches']]
         df = pd.DataFrame(data)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -190,14 +192,23 @@ class MiniZapWithEDA:
         try:
             analysis_result = self.agents["analyst"].process(df)
             
-            plt.figure(figsize=(10, 6))
-            df['value'].plot()
-            plt.title('Value over Time')
-            plt.xlabel('Timestamp')
-            plt.ylabel('Value')
-            plt.savefig('value_over_time.png')
-            plt.close()
+            eda_results = {
+                "shape": df.shape,
+                "columns": df.columns.tolist(),
+                "data_types": df.dtypes.to_dict(),
+                "summary_statistics": df.describe().to_dict(),
+                "missing_values": df.isnull().sum().to_dict(),
+                "correlation_matrix": df.corr().to_dict() if df.select_dtypes(include=[np.number]).shape[1] > 1 else None
+            }
             
+            if isinstance(df.index, pd.DatetimeIndex):
+                eda_results["time_range"] = {
+                    "start": df.index.min().isoformat(),
+                    "end": df.index.max().isoformat(),
+                    "duration": str(df.index.max() - df.index.min())
+                }
+            
+            analysis_result["eda_results"] = eda_results
             return analysis_result
         except Exception as e:
             print(f"EDA failed: {str(e)}")
@@ -228,62 +239,48 @@ class MiniZapWithEDA:
             })
         }
         
-        # Debug: Print flow_result structure and size
-        print("Flow result structure:")
-        print(json.dumps(flow_result, indent=2))
-        print(f"Flow result size: {len(json.dumps(flow_result))} bytes")
-
         vector = self.model.encode([json.dumps(flow_result)])[0].tolist()
         
-        # Debug: Check vector dimension
-        print(f"Vector dimension: {len(vector)}")
-
         try:
             index.upsert([(str(datetime.now().timestamp()), vector, flow_result)])
-            print("Successfully upserted flow result to Pinecone")
         except Exception as e:
             print(f"Error upserting flow result to Pinecone: {str(e)}")
-            # Try upserting with minimal data
-            minimal_flow_result = {"timestamp": flow_result["timestamp"]}
-            try:
-                index.upsert([(str(datetime.now().timestamp()), vector, minimal_flow_result)])
-                print("Successfully upserted minimal data to Pinecone")
-            except Exception as e:
-                print(f"Error upserting minimal data to Pinecone: {str(e)}")
 
-# Example usage
+        return flow_result
+
 if __name__ == "__main__":
     mini_zap = MiniZapWithEDA()
 
-    # Generate a batch of data points
-    batch_size = 10
+    batch_size = 15
     start_time = datetime.now()
     batch_data = [
         {
-            "timestamp": (start_time + timedelta(minutes=i)).isoformat(),
-            "value": 40 + i * 5,
-            "source": f"sensor_{i % 3}"
+            "timestamp": (start_time + timedelta(days=i)).isoformat(),
+            "revenue": 100000 + i * 5000,
+            "expenses": 80000 + i * 3000,
+            "profit_margin": round((100000 + i * 5000 - (80000 + i * 3000)) / (100000 + i * 5000), 2),
+            "customer_acquisition_cost": 50 + i * 0.5,
+            "customer_lifetime_value": 500 + i * 10,
+            "churn_rate": round(0.05 - i * 0.002, 3),
+            "active_users": 10000 + i * 100,
+            "average_order_value": 100 + i * 2,
+            "conversion_rate": round(0.03 + i * 0.001, 3),
+            "customer_satisfaction_score": round(4.0 + i * 0.05, 1),
+            "website_traffic": 50000 + i * 1000,
+            "social_media_engagement": 5000 + i * 200,
+            "product_inventory": 1000 - i * 20,
+            "employee_productivity": round(0.8 + i * 0.01, 2),
+            "source": f"department_{i % 5}"
         }
         for i in range(batch_size)
     ]
     
-    # Run the flow with the batch of data points
-    mini_zap.run_flow(batch_data)
+    flow_result = mini_zap.run_flow(batch_data)
 
-    print("\nFinal EDA Results and Decision:")
-    final_df = mini_zap.process_data()
-    final_analysis = mini_zap.perform_eda(final_df)
-    final_decision = mini_zap.take_action(final_analysis)
-    
-    print("\nAnalysis Result:")
-    print(json.dumps(final_analysis, indent=2))
-    print("\nFinal Decision:")
-    print(json.dumps(final_decision, indent=2))
-    print("\nA plot 'value_over_time.png' has been saved in the current directory.")
-
-    # Retrieve and display flow results
-    query_response = index.query(vector=[0]*384, top_k=1, include_metadata=True)
-    print("\nLast Flow Result:")
-    flow_result = query_response['matches'][0]['metadata']
-    
+    print("\nFinal Flow Result:")
     print(json.dumps(flow_result, indent=2))
+
+    print("\nRetrieving last flow result from Pinecone:")
+    query_response = index.query(vector=[0]*384, top_k=1, include_metadata=True)
+    last_flow_result = query_response['matches'][0]['metadata']
+    print(json.dumps(last_flow_result, indent=2))
